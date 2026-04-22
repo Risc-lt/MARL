@@ -1,0 +1,223 @@
+diff --git a/benchmarl/algorithms/__init__.py b/benchmarl/algorithms/__init__.py
+index 5b6d79c..80ce82a 100644
+--- a/benchmarl/algorithms/__init__.py
++++ b/benchmarl/algorithms/__init__.py
+@@ -7,6 +7,7 @@
+ from .common import Algorithm, AlgorithmConfig
+ from .ensemble import EnsembleAlgorithm, EnsembleAlgorithmConfig
+ from .iddpg import Iddpg, IddpgConfig
++from .hybridppo import Hybridppo, HybridppoConfig
+ from .ippo import Ippo, IppoConfig
+ from .iql import Iql, IqlConfig
+ from .isac import Isac, IsacConfig
+@@ -19,6 +20,8 @@ from .vdn import Vdn, VdnConfig
+ classes = [
+     "Iddpg",
+     "IddpgConfig",
++    "Hybridppo",
++    "HybridppoConfig",
+     "Ippo",
+     "IppoConfig",
+     "Iql",
+@@ -41,6 +44,7 @@ classes = [
+ # This is used to aid loading of algorithms from yaml
+ algorithm_config_registry = {
+     "mappo": MappoConfig,
++    "hybridppo": HybridppoConfig,
+     "ippo": IppoConfig,
+     "maddpg": MaddpgConfig,
+     "iddpg": IddpgConfig,
+diff --git b/benchmarl/algorithms/hybridppo.py b/benchmarl/algorithms/hybridppo.py
+new file mode 100644
+index 0000000..f226727
+--- /dev/null
++++ b/benchmarl/algorithms/hybridppo.py
+@@ -0,0 +1,168 @@
++#  Copyright (c) Meta Platforms, Inc. and affiliates.
++#
++#  This source code is licensed under the license found in the
++#  LICENSE file in the root directory of this source tree.
++#
++
++from dataclasses import MISSING, dataclass
++from typing import Dict, Iterable, Type
++
++import torch
++from tensordict.nn import TensorDictModule, TensorDictSequential
++from torchrl.data import Composite, Unbounded
++from torchrl.objectives import ClipPPOLoss
++
++from benchmarl.algorithms.common import Algorithm, AlgorithmConfig
++from benchmarl.algorithms.mappo import Mappo
++
++
++class _HybridValueMixer(torch.nn.Module):
++    def __init__(self, alpha: float):
++        super().__init__()
++        self.alpha = alpha
++
++    def forward(
++        self, state_value_cent: torch.Tensor, state_value_ind: torch.Tensor
++    ) -> torch.Tensor:
++        return self.alpha * state_value_cent + (1.0 - self.alpha) * state_value_ind
++
++
++class Hybridppo(Mappo):
++    """Hybrid PPO with a centralized and independent critic mixed by alpha."""
++
++    def __init__(self, alpha: float, **kwargs):
++        if not 0.0 <= alpha <= 1.0:
++            raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
++        self.alpha = alpha
++        super().__init__(**kwargs)
++
++    def _get_parameters(self, group: str, loss: ClipPPOLoss) -> Dict[str, Iterable]:
++        return {
++            "loss_objective": list(loss.actor_network_params.flatten_keys().values()),
++            "loss_critic": list(loss.critic_network_params.flatten_keys().values()),
++        }
++
++    def _get_centralized_critic(self, group: str) -> TensorDictSequential:
++        n_agents = len(self.group_map[group])
++        if self.share_param_critic:
++            critic_output_spec = Composite({"state_value_cent": Unbounded(shape=(1,))})
++        else:
++            critic_output_spec = Composite(
++                {
++                    group: Composite(
++                        {"state_value_cent": Unbounded(shape=(n_agents, 1))},
++                        shape=(n_agents,),
++                    )
++                }
++            )
++
++        if self.state_spec is not None:
++            input_has_agent_dim = False
++            critic_input_spec = self.state_spec
++        else:
++            input_has_agent_dim = True
++            critic_input_spec = Composite(
++                {group: self.observation_spec[group].clone().to(self.device)}
++            )
++
++        value_module = self.critic_model_config.get_model(
++            input_spec=critic_input_spec,
++            output_spec=critic_output_spec,
++            n_agents=n_agents,
++            centralised=True,
++            input_has_agent_dim=input_has_agent_dim,
++            agent_group=group,
++            share_params=self.share_param_critic,
++            device=self.device,
++            action_spec=self.action_spec,
++        )
++
++        if self.share_param_critic:
++            expand_module = TensorDictModule(
++                lambda value: value.unsqueeze(-2).expand(*value.shape[:-1], n_agents, 1),
++                in_keys=["state_value_cent"],
++                out_keys=[(group, "state_value_cent")],
++            )
++            value_module = TensorDictSequential(value_module, expand_module)
++
++        return value_module
++
++    def _get_independent_critic(self, group: str) -> TensorDictModule:
++        n_agents = len(self.group_map[group])
++        critic_input_spec = Composite(
++            {group: self.observation_spec[group].clone().to(self.device)}
++        )
++        critic_output_spec = Composite(
++            {
++                group: Composite(
++                    {"state_value_ind": Unbounded(shape=(n_agents, 1))},
++                    shape=(n_agents,),
++                )
++            }
++        )
++        return self.critic_model_config.get_model(
++            input_spec=critic_input_spec,
++            output_spec=critic_output_spec,
++            n_agents=n_agents,
++            centralised=False,
++            input_has_agent_dim=True,
++            agent_group=group,
++            share_params=self.share_param_critic,
++            device=self.device,
++            action_spec=self.action_spec,
++        )
++
++    def get_critic(self, group: str) -> TensorDictSequential:
++        mixing_module = TensorDictModule(
++            _HybridValueMixer(self.alpha),
++            in_keys=[(group, "state_value_cent"), (group, "state_value_ind")],
++            out_keys=[(group, "state_value")],
++        )
++        return TensorDictSequential(
++            self._get_centralized_critic(group),
++            self._get_independent_critic(group),
++            mixing_module,
++        )
++
++
++@dataclass
++class HybridppoConfig(AlgorithmConfig):
++    """Configuration dataclass for :class:`~benchmarl.algorithms.Hybridppo`."""
++
++    share_param_critic: bool = MISSING
++    clip_epsilon: float = MISSING
++    entropy_coef: float = MISSING
++    critic_coef: float = MISSING
++    loss_critic_type: str = MISSING
++    lmbda: float = MISSING
++    scale_mapping: str = MISSING
++    use_tanh_normal: bool = MISSING
++    minibatch_advantage: bool = MISSING
++    alpha: float = MISSING
++
++    @staticmethod
++    def associated_class() -> Type[Algorithm]:
++        return Hybridppo
++
++    @staticmethod
++    def supports_continuous_actions() -> bool:
++        return True
++
++    @staticmethod
++    def supports_discrete_actions() -> bool:
++        return True
++
++    @staticmethod
++    def on_policy() -> bool:
++        return True
++
++    @staticmethod
++    def has_centralized_critic() -> bool:
++        return False
++
++    @staticmethod
++    def has_independent_critic() -> bool:
++        return False
++
++    def has_critic(self) -> bool:
++        return True
+diff --git b/benchmarl/conf/algorithm/hybridppo.yaml b/benchmarl/conf/algorithm/hybridppo.yaml
+new file mode 100644
+index 0000000..df8cccc
+--- /dev/null
++++ b/benchmarl/conf/algorithm/hybridppo.yaml
+@@ -0,0 +1,14 @@
++defaults:
++  - hybridppo_config
++  - _self_
++
++share_param_critic: True
++clip_epsilon: 0.2
++entropy_coef: 0.0
++critic_coef: 1.0
++loss_critic_type: "l2"
++lmbda: 0.9
++scale_mapping: "biased_softplus_1.0"
++use_tanh_normal: True
++minibatch_advantage: False
++alpha: 0.5
