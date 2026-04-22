@@ -7,6 +7,7 @@ MARL/
 ├── README.md
 ├── src/                              # Experiment scripts
 │   ├── mappo_vmas_balance.py         # MAPPO + VMAS Balance
+│   ├── hybridppo_vmas.py             # HybridPPO + VMAS Balance/Navigation
 │   ├── ippo_vmas_navigation.py       # IPPO + VMAS Navigation
 │   ├── mappo_pettingzoo_simple_spread.py  # MAPPO + PettingZoo Simple Spread
 │   └── ippo_pettingzoo_simple_tag.py      # IPPO + PettingZoo Simple Tag
@@ -80,6 +81,7 @@ python -c "import benchmarl, vmas, pettingzoo; print('All good!')"
 ```bash
 # From the MARL root directory, with the venv activated:
 python src/mappo_vmas_balance.py
+python src/hybridppo_vmas.py --task balance --alpha 0.5 --seed 0 --max_frames 3000000
 python src/ippo_vmas_navigation.py
 python src/mappo_pettingzoo_simple_spread.py
 python src/ippo_pettingzoo_simple_tag.py
@@ -90,22 +92,77 @@ python src/ippo_pettingzoo_simple_tag.py
 ```bash
 # From third_party/BenchMARL/:
 python benchmarl/run.py algorithm=mappo task=vmas/balance
+python benchmarl/run.py algorithm=hybridppo task=vmas/balance algorithm.alpha=0.5
 python benchmarl/run.py algorithm=ippo task=vmas/navigation
 python benchmarl/run.py algorithm=mappo task=pettingzoo/simple_spread
 python benchmarl/run.py algorithm=ippo task=pettingzoo/simple_tag
 ```
 
+##### HybridPPO notes
+
+HybridPPO adds a mixed critic on top of the existing PPO pipeline:
+
+- `alpha = 1.0` behaves like MAPPO
+- `alpha = 0.0` behaves like IPPO
+- `alpha in (0, 1)` linearly mixes the centralized and independent critics
+
+Implemented files:
+
+- `third_party/BenchMARL/benchmarl/algorithms/hybridppo.py`
+- `third_party/BenchMARL/benchmarl/conf/algorithm/hybridppo.yaml`
+- `src/hybridppo_vmas.py`
+
+Recommended VMAS CLI commands:
+
+```bash
+# Smoke test
+python benchmarl/run.py algorithm=hybridppo task=vmas/balance \
+  seed=56 \
+  algorithm.alpha=0.5 \
+  experiment.max_n_frames=12000 \
+  experiment.evaluation_interval=6000 \
+  experiment.loggers='[csv]' \
+  experiment.render=false \
+  experiment.save_folder=C:/bm_runs
+
+# Full training
+python benchmarl/run.py algorithm=hybridppo task=vmas/balance \
+  seed=56 \
+  algorithm.alpha=0.5 \
+  experiment.max_n_frames=3000000 \
+  experiment.loggers='[csv]' \
+  experiment.render=false \
+  experiment.save_folder=C:/bm_runs
+```
+
+Supported runner arguments for `src/hybridppo_vmas.py`:
+
+- `--task balance|navigation`
+- `--alpha FLOAT`
+- `--seed INT`
+- `--max_frames INT`
+- `--save_dir PATH` (optional)
+
+Windows path note:
+
+- When using the BenchMARL CLI on Windows, set `experiment.save_folder` to a short existing path such as `C:/bm_runs`.
+- BenchMARL does not create missing parent directories for `experiment.save_folder`, so create it first if needed.
+
 ##### Option C: Run all 4 combos as a benchmark
 
 ```python
 from benchmarl.benchmark import Benchmark
-from benchmarl.algorithms import MappoConfig, IppoConfig
+from benchmarl.algorithms import HybridppoConfig, IppoConfig, MappoConfig
 from benchmarl.environments import VmasTask, PettingZooTask
 from benchmarl.experiment import ExperimentConfig
 from benchmarl.models.mlp import MlpConfig
 
 Benchmark(
-    algorithm_configs=[MappoConfig.get_from_yaml(), IppoConfig.get_from_yaml()],
+    algorithm_configs=[
+        MappoConfig.get_from_yaml(),
+        IppoConfig.get_from_yaml(),
+        HybridppoConfig.get_from_yaml(),
+    ],
     tasks=[VmasTask.BALANCE.get_from_yaml(), PettingZooTask.SIMPLE_SPREAD.get_from_yaml()],
     seeds={0, 1},
     experiment_config=ExperimentConfig.get_from_yaml(),
@@ -160,6 +217,12 @@ python benchmarl/run.py algorithm=mappo task=vmas/balance \
   experiment.evaluation_interval=6000 \
   experiment.loggers='[csv]' \
   experiment.render=false
+```
+
+For HybridPPO add:
+
+```bash
+algorithm=hybridppo algorithm.alpha=0.5 seed=56 experiment.save_folder=C:/bm_runs
 ```
 
 ---
